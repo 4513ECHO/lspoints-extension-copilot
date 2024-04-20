@@ -32,7 +32,7 @@ function! s:get_display_adjustment(candidate) abort
   endif
   let line = getline('.')
   let offset = col('.') - 1
-  let choice_text = strpart(line, 0, line->byteidx(a:candidate.range.start.character, v:true)) .. a:candidate.text->substitute("\n*$", '', '')
+  let choice_text = strpart(line, 0, line->byteidx(a:candidate.range.start.character, v:true)) .. a:candidate.insertText->substitute("\n*$", '', '')
   let typed = line->strpart(0, offset)
   let end_offset = line->byteidx(a:candidate.range.end.character, v:true)
   if end_offset < 0
@@ -112,15 +112,20 @@ function! lspoints#extension#copilot#accept(options = {}) abort
     return ''
   endif
   unlet! b:__copilot
-  if a:options->has_key('pattern')
-    let text = text->matchstr("\n*\\%(" .. a:options.pattern ..'\)')
-          \ ->substitute("\n*$", '', '') ?? text
+  let replaced = a:options->has_key('pattern') ?
+        \ (text->matchstr("\n*\\%(" .. a:options.pattern ..'\)')
+        \   ->substitute("\n*$", '', '') ?? text)
+        \ : text
+  if text ==# replaced && candidate->has_key('command')
+    call lspoints#request('copilot', 'workspace/executeCommand', candidate.command)
+  else
+    let line_text = strpart(getline('.'), 0, col('.') - 1) .. replaced
+    call lspoints#notify('copilot', 'textDocument/didPartiallyAcceptCompletion', #{
+          \ item: candidate,
+          \ acceptedLength: strutf16len(line_text, v:true) - candidate.range.start.character,
+          \ })
   endif
-  call lspoints#request('copilot', 'notifyAccepted', #{
-        \ uuid: candidate.uuid,
-        \ acceptedLength: strutf16len(text, v:true),
-        \ })
-  call lspoints#extension#copilot#clear_preview()
+  call lspoints#denops#notify('executeCommand', ['copilot', 'clearPreview'])
   " NOTE: Append <C-u> after <CR> to avoid auto-indentation
   eval [repeat("\<BS>", outdent), repeat("\<Del>", delete),
         \ text->substitute("\n", "\n\<C-u>", 'g'), a:options->has_key('pattern') ?  '' : "\<End>",
@@ -134,6 +139,10 @@ function! lspoints#extension#copilot#on_filetype() abort
   endif
 endfunction
 
+function! lspoints#extension#copilot#on_insert_leave_pre() abort
+  call lspoints#denops#notify('executeCommand', ['copilot', 'clearPreview'])
+endfunction
+
 function! lspoints#extension#copilot#on_insert_enter() abort
   call s:schedule()
 endfunction
@@ -143,7 +152,7 @@ function! lspoints#extension#copilot#on_cursor_moved() abort
 endfunction
 
 function s:schedule() abort
-  call lspoints#extension#copilot#draw_preview()
+  call lspoints#denops#notify('executeCommand', ['copilot', 'drawPreview'])
   call timer_stop(s:timer)
   let s:timer = timer_start(s:delay, function('s:trigger', [bufnr('')]))
 endfunction
@@ -164,15 +173,6 @@ function! lspoints#extension#copilot#on_buf_enter() abort
 endfunction
 
 function! lspoints#extension#copilot#on_buf_unload() abort
-  call s:reject(+expand('<abuf>'))
-endfunction
-
-function! s:reject(bufnr) abort
-  let context = getbufvar(a:bufnr, '__copilot', {})
-  if !empty(context->get('shownCandidates', {}))
-    call lspoints#request('copilot', 'notifyRejected', #{ uuids: keys(context.shownCandidates) })
-    let context.shownCandidates = {}
-  endif
 endfunction
 
 function! lspoints#extension#copilot#initalize() abort
@@ -198,8 +198,7 @@ function! lspoints#extension#copilot#prev() abort
 endfunction
 
 function! lspoints#extension#copilot#dismiss() abort
-  call s:reject('%')
   call timer_stop(s:timer)
   unlet! b:__copilot
-  call lspoints#extension#copilot#draw_preview()
+  call lspoints#denops#notify('executeCommand', ['copilot', 'drawPreview'])
 endfunction

@@ -13,7 +13,7 @@ augroup lspoints_extension_copilot
   autocmd ColorScheme * call s:on_colorscheme()
   call s:on_colorscheme()
   autocmd FileType * call lspoints#extension#copilot#on_filetype()
-  autocmd InsertLeave * call lspoints#extension#copilot#clear_preview()
+  autocmd InsertLeavePre * call lspoints#extension#copilot#on_insert_leave_pre()
   autocmd InsertEnter * call lspoints#extension#copilot#on_insert_enter()
   autocmd CursorMovedI * call lspoints#extension#copilot#on_cursor_moved()
   autocmd BufEnter * call lspoints#extension#copilot#on_buf_enter()

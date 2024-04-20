@@ -3,34 +3,31 @@ import {
   BaseExtension,
   type Lspoints,
 } from "https://deno.land/x/lspoints@v0.0.7/interface.ts";
-import { LSP } from "https://deno.land/x/lspoints@v0.0.7/deps/lsp.ts";
+import { LSP, LSPTypes } from "https://deno.land/x/lspoints@v0.0.7/deps/lsp.ts";
 import { is, u } from "https://deno.land/x/lspoints@v0.0.7/deps/unknownutil.ts";
 import * as batch from "https://deno.land/x/denops_std@v6.4.0/batch/mod.ts";
 import { fromFileUrl } from "https://deno.land/std@0.223.0/path/from_file_url.ts";
 
 type VimFuncref = unknown;
+type CopilotTriggerKind = /* Invoked */ 0 | /* Automatic */ 1;
 type Params = {
-  doc: {
-    indentSize: number;
+  context: {
+    triggerKind: CopilotTriggerKind;
+  };
+  formattingOptions: {
     insertSpaces: boolean;
-    position: LSP.Position;
     tabSize: number;
-    uri: string | number;
-    version: number;
   };
   position: LSP.Position;
-  textDocument: {
-    uri: string | number;
-    version: number;
-  };
+  textDocument:
+    | LSP.VersionedTextDocumentIdentifier
+    | { uri: number };
 };
+type Target = [bufnr: number, changedtick: number, lnum: number, col: number];
 type Candidate = {
-  displayText: string;
-  docVersion: number;
-  position: LSP.Position;
+  command: LSP.Command;
   range: LSP.Range;
-  text: string;
-  uuid: string;
+  insertText: string;
 };
 type Agent<T extends string> = {
   agent_id: number;
@@ -60,7 +57,6 @@ type OriginalCopilotContext = {
 type CopilotContext = {
   candidates: Candidate[];
   selected: number;
-  shownCandidates: Record<string, true>;
   params: Params;
 };
 
@@ -80,63 +76,78 @@ const isRange: u.Predicate<LSP.Range> = is.ObjectOf({
   start: isPosition,
   end: isPosition,
 });
+const isVersionedTextDocumentIdentifier: u.Predicate<
+  LSP.VersionedTextDocumentIdentifier
+> = is.ObjectOf({
+  uri: is.String,
+  version: is.Number,
+});
+const triggerKind = {
+  Invoked: 0,
+  Automatic: 1,
+} as const satisfies Record<string, CopilotTriggerKind>;
+const isTriggerKind: u.Predicate<CopilotTriggerKind> = is.LiteralOneOf([
+  triggerKind.Invoked,
+  triggerKind.Automatic,
+]);
+const isCommand: u.Predicate<LSP.Command> = is.ObjectOf({
+  title: is.String,
+  command: is.String,
+  arguments: is.OptionalOf(is.Any),
+});
 const isCandidate: u.Predicate<Candidate> = is.ObjectOf({
-  displayText: is.String,
-  docVersion: is.Number,
-  position: isPosition,
+  command: isCommand,
   range: isRange,
-  text: is.String,
-  uuid: is.String,
+  insertText: is.String,
 });
 const isParams: u.Predicate<Params> = is.ObjectOf({
-  doc: is.ObjectOf({
-    indentSize: is.Number,
+  context: is.ObjectOf({
+    triggerKind: isTriggerKind,
+  }),
+  formattingOptions: is.ObjectOf({
     insertSpaces: is.Boolean,
-    position: isPosition,
     tabSize: is.Number,
-    uri: is.UnionOf([is.String, is.Number]),
-    version: is.Number,
   }),
   position: isPosition,
-  textDocument: is.ObjectOf({
-    uri: is.UnionOf([is.String, is.Number]),
-    version: is.Number,
-  }),
+  textDocument: is.UnionOf([
+    isVersionedTextDocumentIdentifier,
+    is.ObjectOf({ uri: is.Number }),
+  ]),
 });
 
-async function makeParams(denops: Denops): Promise<Params> {
-  const [uri, version, insertSpaces, shiftWidth, line, lnum, col, mode] =
-    await batch.collect(
-      denops,
-      (denops) => [
-        denops.call("bufnr", ""),
-        denops.call("getbufvar", "", "changedtick"),
-        denops.eval("&expandtab"),
-        denops.call("shiftwidth"),
-        denops.call("getline", "."),
-        denops.call("line", "."),
-        denops.call("col", "."),
-        denops.call("mode"),
-      ],
-    ) as [number, number, number, number, string, number, number, string];
+async function makeParamsAndTarget(denops: Denops): Promise<[Params, Target]> {
+  const [uri, changedtick, insertSpaces, shiftWidth, line, lnum, col, mode] =
+    await batch
+      .collect(
+        denops,
+        (denops) => [
+          denops.call("bufnr", ""),
+          denops.call("getbufvar", "", "changedtick", 0),
+          denops.eval("&expandtab"),
+          denops.call("shiftwidth"),
+          denops.call("getline", "."),
+          denops.call("line", "."),
+          denops.call("col", "."),
+          denops.call("mode"),
+        ],
+      ) as [number, number, number, number, string, number, number, string];
   const position: LSP.Position = {
     line: lnum - 1,
     character: line
       .substring(0, col - (/^[iR]/.test(mode) || !line ? 1 : 0))
       .length,
   };
-  return {
-    doc: {
-      uri,
-      version,
+  const params: Params = {
+    context: { triggerKind: triggerKind.Automatic },
+    formattingOptions: {
       insertSpaces: !!insertSpaces,
       tabSize: shiftWidth,
-      indentSize: shiftWidth,
-      position,
     },
     position,
-    textDocument: { uri, version },
+    textDocument: { uri },
   };
+  const target: Target = [uri, changedtick, lnum, col];
+  return [params, target];
 }
 
 async function getCurrentCandidate(denops: Denops): Promise<Candidate | null> {
@@ -177,7 +188,7 @@ async function getDisplayAdjustment(
   ) as [string, number];
   const offset = col - 1;
   const selectedText = line.substring(0, candidate.range.start.character) +
-    candidate.text.replace(/\n*$/, "");
+    candidate.insertText.replace(/\n*$/, "");
   const typed = line.substring(0, offset);
   const endOffset = line.length > candidate.range.end.character
     ? line.length
@@ -200,25 +211,24 @@ async function getDisplayAdjustment(
 const hlgroup = "CopilotSuggestion";
 const annotHlgroup = "CopilotAnnotation";
 
-async function drawPreview(denops: Denops): Promise<string | undefined> {
+async function drawPreview(denops: Denops, lspoints: Lspoints): Promise<void> {
   const candidate = await getCurrentCandidate(denops);
-  const text = candidate?.displayText.split("\n");
+  const text = candidate?.insertText.split("\n");
   await clearPreview(denops);
   if (!candidate || !text) {
     return;
   }
   const annot = "";
-  const [col, lnum, colEnd, context] = await batch.collect(
+  const [col, lnum, colEnd] = await batch.collect(
     denops,
     (denops) => [
       denops.call("col", "."),
       denops.call("line", "."),
       denops.call("col", "$"),
-      denops.call("getbufvar", "", "__copilot", null),
     ],
-  ) as [number, number, number, CopilotContext | null];
-  const newlinePos = candidate.text.indexOf("\n");
-  text[0] = candidate.text.substring(
+  ) as [number, number, number];
+  const newlinePos = candidate.insertText.indexOf("\n");
+  text[0] = candidate.insertText.substring(
     col - 1,
     newlinePos > -1 ? newlinePos : undefined,
   );
@@ -266,9 +276,10 @@ async function drawPreview(denops: Denops): Promise<string | undefined> {
         }
       });
   }
-  if (context && !context.shownCandidates[candidate.uuid]) {
-    return candidate.uuid;
-  }
+  console.log({ candidate });
+  await lspoints.notify("copilot", "textDocuemt/didShowCompletion", {
+    item: candidate,
+  });
 }
 
 async function clearPreview(denops: Denops): Promise<void> {
@@ -321,49 +332,45 @@ export class Extension extends BaseExtension {
 
     lspoints.defineCommands("copilot", {
       suggest: async () => {
-        const params = await makeParams(denops);
+        const [params, target] = await makeParamsAndTarget(denops);
         const client = lspoints.getClient("copilot");
         if (!client) {
           return;
         }
         // Sync textDocument
-        for (const doc of [params.doc, params.textDocument]) {
-          if (is.Number(doc.uri)) {
-            const bufnr = doc.uri;
-            if (!client.isAttached(bufnr)) {
-              return;
-            }
-            doc.uri = client.getUriFromBufNr(bufnr);
-            doc.version = client.getDocumentVersion(bufnr);
+        if (is.Number(params.textDocument.uri)) {
+          const bufnr = params.textDocument.uri;
+          if (!client.isAttached(bufnr)) {
+            return;
           }
+          console.log("sync textDocument", bufnr);
+          params.textDocument = {
+            uri: client.getUriFromBufNr(bufnr),
+            version: client.getDocumentVersion(bufnr),
+          } satisfies LSP.VersionedTextDocumentIdentifier;
         }
-        lspoints.request("copilot", "getCompletions", params)
-          .then((result) =>
-            u.ensure(
-              result,
-              is.ObjectOf({ completions: is.ArrayOf(isCandidate) }),
-            )
-          )
-          .then(({ completions }) =>
-            denops.cmd("let b:__copilot = context", {
-              context: {
-                candidates: completions,
-                selected: 0,
-                shownCandidates: {},
-                params,
-              } satisfies CopilotContext,
-            })
-          )
-          .then(() => drawPreview(denops))
-          .then((uuid) => {
-            if (uuid) {
-              denops.cmd(
-                "let b:__copilot.shownCandidates[uuid] = v:true",
-                { uuid },
-              );
-              lspoints.request("copilot", "notifyShown", { uuid });
-            }
-          });
+        const { items } = u.ensure(
+          await lspoints.request(
+            "copilot",
+            "textDocument/inlineCompletion",
+            params,
+          ),
+          is.ObjectOf({ items: is.ArrayOf(isCandidate) }),
+        );
+        await denops.cmd("let b:__copilot = context", {
+          context: {
+            candidates: items,
+            selected: 0,
+            params,
+          } satisfies CopilotContext,
+        });
+        await drawPreview(denops, lspoints);
+      },
+      drawPreview: async () => {
+        await drawPreview(denops, lspoints);
+      },
+      clearPreview: async () => {
+        await clearPreview(denops);
       },
       notifyDidFocus: async (bufnr) => {
         const client = lspoints.getClient("copilot");
